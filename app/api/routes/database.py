@@ -17,8 +17,10 @@ from app.core.config import settings
 from app.db.session import get_db_session
 from app.models import DocumentSegment
 from app.schemas.database import (
+    ConversationSummaryDocument,
     ConversationSummaryEnvelope,
     ConversationSummaryResponse,
+    ConversationTurnDocument,
     DatasetRetrieveEnvelope,
     DatasetRetrieveRequest,
     DatasetRetrieveResponse,
@@ -336,6 +338,13 @@ def retrieve_dataset(
             retrieval_query=retrieval_query,
             final_summary=final_summary,
             document_ids=[str(document.document_id) for document in documents],
+            document_metadata=[
+                ConversationTurnDocument(
+                    document_id=str(document.document_id),
+                    document_name=document.document_name,
+                )
+                for document in documents
+            ],
         )
         logger.info(
             "Conversation turn appended: conversation_id=%s turn_id=%s document_count=%s",
@@ -451,6 +460,7 @@ def retrieve_dataset(
 @router.get("/conversations/{conversation_id}/summary", response_model=ConversationSummaryEnvelope)
 def summarize_conversation(
     conversation_id: str,
+    session: DbSession,
 ) -> ConversationSummaryEnvelope | JSONResponse:
     try:
         logger.info("Conversation summary started: conversation_id=%s", conversation_id)
@@ -477,6 +487,74 @@ def summarize_conversation(
                 for turn in conversation_session.turns
             ],
         )
+        document_ids: list[UUID] = []
+        seen_document_ids: set[UUID] = set()
+        document_name_map: dict[UUID, str | None] = {}
+        for turn in conversation_session.turns:
+            for document in turn.document_metadata:
+                try:
+                    metadata_document_id = UUID(str(document.document_id))
+                except ValueError:
+                    logger.warning(
+                        "Skipping invalid document metadata id in conversation summary: conversation_id=%s document_id=%s",
+                        conversation_session.conversation_id,
+                        document.document_id,
+                    )
+                    continue
+                document_name_map.setdefault(metadata_document_id, document.document_name)
+            for document_id_value in turn.document_ids:
+                try:
+                    document_id = UUID(str(document_id_value))
+                except ValueError:
+                    logger.warning(
+                        "Skipping invalid document id in conversation summary: conversation_id=%s document_id=%s",
+                        conversation_session.conversation_id,
+                        document_id_value,
+                    )
+                    continue
+                if document_id in seen_document_ids:
+                    continue
+                seen_document_ids.add(document_id)
+                document_ids.append(document_id)
+        logger.info(
+            "Conversation summary collected document ids: conversation_id=%s unique_documents=%s",
+            conversation_session.conversation_id,
+            len(document_ids),
+        )
+
+        summary_documents: list[ConversationSummaryDocument] = []
+        if document_ids:
+            stmt = (
+                select(DocumentSegment)
+                .where(DocumentSegment.document_id.in_(document_ids))
+                .order_by(
+                    DocumentSegment.document_id.asc(),
+                    DocumentSegment.position.asc(),
+                )
+            )
+            segments = session.scalars(stmt).all()
+            content_map: dict[UUID, list[str]] = {document_id: [] for document_id in document_ids}
+            for segment in segments:
+                content_map.setdefault(segment.document_id, []).append(segment.content)
+
+            summary_documents = [
+                ConversationSummaryDocument(
+                    document_id=document_id,
+                    document_name=document_name_map.get(document_id),
+                    download_url=export_document_content(
+                        document_id=str(document_id),
+                        document_name=document_name_map.get(document_id) or str(document_id),
+                        content="\n".join(content_map.get(document_id, [])),
+                    )[1],
+                )
+                for document_id in document_ids
+                if content_map.get(document_id)
+            ]
+        logger.info(
+            "Conversation summary prepared document downloads: conversation_id=%s exported_documents=%s",
+            conversation_session.conversation_id,
+            len(summary_documents),
+        )
         logger.info(
             "Conversation summary generated: conversation_id=%s summary_length=%s",
             conversation_session.conversation_id,
@@ -487,6 +565,7 @@ def summarize_conversation(
             conversation_id=conversation_session.conversation_id,
             conversation_title=conversation_session.title,
             summary_markdown=summary_markdown,
+            documents=summary_documents,
         )
         logger.info(
             "Conversation summary finished successfully: conversation_id=%s",

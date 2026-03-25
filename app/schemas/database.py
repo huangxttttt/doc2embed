@@ -125,6 +125,29 @@ class DatasetRetrieveEnvelope(BaseModel):
     success: bool
 
 
+class ConversationSummaryDocument(BaseModel):
+    document_id: UUID = Field(alias="documentId", serialization_alias="documentId")
+    document_name: str | None = Field(
+        default=None,
+        alias="documentName",
+        serialization_alias="documentName",
+    )
+    download_url: str = Field(alias="downloadUrl", serialization_alias="downloadUrl")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ConversationTurnDocument(BaseModel):
+    document_id: str = Field(alias="documentId", serialization_alias="documentId")
+    document_name: str | None = Field(
+        default=None,
+        alias="documentName",
+        serialization_alias="documentName",
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class ConversationSummaryResponse(BaseModel):
     conversation_id: str = Field(
         alias="conversationId",
@@ -139,6 +162,7 @@ class ConversationSummaryResponse(BaseModel):
         alias="summaryMarkdown",
         serialization_alias="summaryMarkdown",
     )
+    documents: list[ConversationSummaryDocument] = Field(default_factory=list)
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -152,6 +176,11 @@ class ConversationSummaryEnvelope(BaseModel):
 
 
 class ConversationTurn(BaseModel):
+    document_metadata: list[ConversationTurnDocument] = Field(
+        default_factory=list,
+        alias="documentMetadata",
+        serialization_alias="documentMetadata",
+    )
     turn_id: str = Field(alias="turnId", serialization_alias="turnId")
     query: str
     retrieval_query: str = Field(

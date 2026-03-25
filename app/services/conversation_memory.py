@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.core.config import settings
-from app.schemas.database import ConversationSession, ConversationTurn
+from app.schemas.database import ConversationSession, ConversationTurn, ConversationTurnDocument
 
 
 def _conversation_dir() -> Path:
@@ -83,6 +83,7 @@ def append_turn(
     retrieval_query: str,
     final_summary: str,
     document_ids: list[str],
+    document_metadata: list[ConversationTurnDocument],
 ) -> ConversationTurn:
     turn = ConversationTurn(
         turn_id=str(uuid4()),
@@ -91,6 +92,7 @@ def append_turn(
         final_summary=final_summary,
         created_at=_utc_now(),
         document_ids=document_ids,
+        document_metadata=document_metadata,
     )
     session.turns.append(turn)
     session.updated_at = turn.created_at
