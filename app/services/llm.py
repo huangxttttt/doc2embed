@@ -1,3 +1,4 @@
+from http.client import IncompleteRead
 import json
 from typing import Any
 from urllib import error, request
@@ -46,6 +47,15 @@ def _post_chat_completion(messages: list[dict[str, Any]]) -> dict[str, Any]:
         with request.urlopen(req, timeout=settings.llm_timeout_seconds) as response:
             body = response.read().decode("utf-8")
             data = json.loads(body)
+    except IncompleteRead as exc:
+        partial = exc.partial.decode("utf-8", errors="ignore") if exc.partial else ""
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "LLM response was interrupted before completion."
+                + (f" Partial body: {partial}" if partial else "")
+            ),
+        ) from exc
     except error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="ignore")
         raise HTTPException(

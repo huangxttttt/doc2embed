@@ -117,6 +117,14 @@ class DatasetRetrieveResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class DatasetRetrieveEnvelope(BaseModel):
+    code: str
+    status: int
+    msg: str
+    data: DatasetRetrieveResponse | dict[str, object]
+    success: bool
+
+
 class ConversationSummaryResponse(BaseModel):
     conversation_id: str = Field(
         alias="conversationId",
@@ -133,6 +141,14 @@ class ConversationSummaryResponse(BaseModel):
     )
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+class ConversationSummaryEnvelope(BaseModel):
+    code: str
+    status: int
+    msg: str
+    data: ConversationSummaryResponse | dict[str, object]
+    success: bool
 
 
 class ConversationTurn(BaseModel):

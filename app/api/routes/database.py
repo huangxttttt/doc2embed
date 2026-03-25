@@ -1,4 +1,6 @@
+from http.client import IncompleteRead
 import json
+import logging
 from pathlib import Path
 from urllib import error, request
 from uuid import UUID
@@ -6,7 +8,7 @@ from uuid import UUID
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import MetaData, Table, inspect, select, text
 from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -15,7 +17,9 @@ from app.core.config import settings
 from app.db.session import get_db_session
 from app.models import DocumentSegment
 from app.schemas.database import (
+    ConversationSummaryEnvelope,
     ConversationSummaryResponse,
+    DatasetRetrieveEnvelope,
     DatasetRetrieveRequest,
     DatasetRetrieveResponse,
     DocumentSegmentRead,
@@ -40,8 +44,27 @@ from app.services.llm import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("uvicorn.error")
 
 DbSession = Annotated[Session, Depends(get_db_session)]
+
+
+def _dataset_retrieve_error_response(status_code: int, msg: str) -> JSONResponse:
+    logger.warning(
+        "Dataset API request failed: status=%s msg=%s",
+        status_code,
+        msg,
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "code": "-1",
+            "status": status_code,
+            "msg": msg,
+            "data": {},
+            "success": False,
+        },
+    )
 
 
 @router.get("/ping")
@@ -159,15 +182,21 @@ def download_exported_document(file_name: str) -> FileResponse:
     )
 
 
-@router.post("/datasets/retrieve", response_model=DatasetRetrieveResponse)
+@router.post("/datasets/retrieve", response_model=DatasetRetrieveEnvelope)
 def retrieve_dataset(
     payload: DatasetRetrieveRequest,
     session: DbSession,
-) -> DatasetRetrieveResponse:
+) -> DatasetRetrieveEnvelope | JSONResponse:
+    logger.info(
+        "Dataset retrieve started: dataset_id=%s conversation_id=%s query=%s",
+        payload.dataset_id,
+        payload.conversation_id or "",
+        payload.query,
+    )
     if not settings.dify_dataset_api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="Dify dataset API key is not configured.",
+        return _dataset_retrieve_error_response(
+            500,
+            "Dify dataset API key is not configured.",
         )
 
     dataset_url = (
@@ -177,12 +206,29 @@ def retrieve_dataset(
 
     try:
         conversation_session = load_or_create_session(payload.conversation_id)
+        logger.info(
+            "Conversation session loaded: conversation_id=%s existing_turns=%s title_present=%s",
+            conversation_session.conversation_id,
+            len(conversation_session.turns),
+            bool(conversation_session.title),
+        )
         if not conversation_session.title and not conversation_session.turns:
             conversation_session.title = generate_conversation_title(payload.query)
+            logger.info(
+                "Generated new conversation title: conversation_id=%s title=%s",
+                conversation_session.conversation_id,
+                conversation_session.title,
+            )
         conversation_context = build_conversation_context(conversation_session)
         retrieval_query = expand_query_for_retrieval(
             payload.query,
             conversation_context=conversation_context,
+        )
+        logger.info(
+            "Retrieval query prepared: conversation_id=%s retrieval_query=%s recent_turns=%s",
+            conversation_session.conversation_id,
+            retrieval_query,
+            len(conversation_context.get("recentTurns", [])),
         )
 
         body = json.dumps({"query": retrieval_query}).encode("utf-8")
@@ -195,9 +241,19 @@ def retrieve_dataset(
             },
             method="POST",
         )
+        logger.info(
+            "Calling Dify dataset retrieve: url=%s timeout_seconds=%s",
+            dataset_url,
+            settings.dify_timeout_seconds,
+        )
         with request.urlopen(req, timeout=settings.dify_timeout_seconds) as response:
             response_body = response.read().decode("utf-8")
             data = json.loads(response_body)
+        logger.info(
+            "Dify dataset retrieve completed: conversation_id=%s record_count=%s",
+            conversation_session.conversation_id,
+            len(data.get("records", [])),
+        )
 
         ordered_document_ids: list[UUID] = []
         seen_document_ids: set[UUID] = set()
@@ -219,6 +275,11 @@ def retrieve_dataset(
             if document_id not in seen_document_ids:
                 seen_document_ids.add(document_id)
                 ordered_document_ids.append(document_id)
+        logger.info(
+            "Document ids extracted from Dify response: conversation_id=%s unique_documents=%s",
+            conversation_session.conversation_id,
+            len(ordered_document_ids),
+        )
 
         documents: list[RetrievedDocumentContent] = []
         if ordered_document_ids:
@@ -245,6 +306,11 @@ def retrieve_dataset(
                 for document_id in ordered_document_ids
                 if content_map.get(document_id)
             ]
+        logger.info(
+            "Document contents assembled: conversation_id=%s documents_with_content=%s",
+            conversation_session.conversation_id,
+            len(documents),
+        )
 
         analysis_by_id, final_summary = analyze_documents(
             query=payload.query,
@@ -258,12 +324,24 @@ def retrieve_dataset(
             ],
             conversation_context=conversation_context,
         )
+        logger.info(
+            "Document analysis completed: conversation_id=%s analyzed_documents=%s summary_length=%s",
+            conversation_session.conversation_id,
+            len(analysis_by_id),
+            len(final_summary),
+        )
         turn = append_turn(
             conversation_session,
             query=payload.query,
             retrieval_query=retrieval_query,
             final_summary=final_summary,
             document_ids=[str(document.document_id) for document in documents],
+        )
+        logger.info(
+            "Conversation turn appended: conversation_id=%s turn_id=%s document_count=%s",
+            conversation_session.conversation_id,
+            turn.turn_id,
+            len(documents),
         )
         conversation_session.memory_summary = summarize_conversation_memory(
             query=payload.query,
@@ -272,6 +350,12 @@ def retrieve_dataset(
             latest_final_summary=final_summary,
         )
         save_session(conversation_session)
+        logger.info(
+            "Conversation session saved: conversation_id=%s total_turns=%s memory_summary_length=%s",
+            conversation_session.conversation_id,
+            len(conversation_session.turns),
+            len(conversation_session.memory_summary),
+        )
 
         documents = [
             RetrievedDocumentContent(
@@ -294,6 +378,11 @@ def retrieve_dataset(
                 for document in documents
             )
         ]
+        logger.info(
+            "Document exports generated: conversation_id=%s exported_documents=%s",
+            conversation_session.conversation_id,
+            len(documents),
+        )
 
         response = DatasetRetrieveResponse(
             query=payload.query,
@@ -308,40 +397,72 @@ def retrieve_dataset(
             ],
             final_summary=final_summary,
         )
-        return response.model_dump(by_alias=True)
+        logger.info(
+            "Dataset retrieve finished successfully: conversation_id=%s response_documents=%s",
+            conversation_session.conversation_id,
+            len(response.documents),
+        )
+        return DatasetRetrieveEnvelope(
+            code="0",
+            status=200,
+            msg="",
+            data=response.model_dump(by_alias=True),
+            success=True,
+        )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _dataset_retrieve_error_response(400, str(exc))
+    except IncompleteRead as exc:
+        partial = exc.partial.decode("utf-8", errors="ignore") if exc.partial else ""
+        return _dataset_retrieve_error_response(
+            502,
+            "Upstream response was interrupted before completion."
+            + (f" Partial body: {partial}" if partial else ""),
+        )
     except error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="ignore")
-        raise HTTPException(
-            status_code=exc.code,
-            detail=error_body or f"Dify retrieve request failed with status {exc.code}.",
-        ) from exc
+        return _dataset_retrieve_error_response(
+            exc.code,
+            error_body or f"Dify retrieve request failed with status {exc.code}.",
+        )
     except SQLAlchemyError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Unable to query document segments: {exc}",
-        ) from exc
+        return _dataset_retrieve_error_response(
+            503,
+            f"Unable to query document segments: {exc}",
+        )
     except error.URLError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Unable to connect to Dify dataset service: {exc.reason}",
-        ) from exc
+        return _dataset_retrieve_error_response(
+            503,
+            f"Unable to connect to Dify dataset service: {exc.reason}",
+        )
     except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Invalid JSON response from Dify dataset service: {exc}",
-        ) from exc
+        return _dataset_retrieve_error_response(
+            502,
+            f"Invalid JSON response from Dify dataset service: {exc}",
+        )
+    except Exception:
+        logger.exception(
+            "Unexpected error during dataset retrieve: dataset_id=%s conversation_id=%s",
+            payload.dataset_id,
+            payload.conversation_id or "",
+        )
+        return _dataset_retrieve_error_response(500, "Internal server error.")
 
 
-@router.get("/conversations/{conversation_id}/summary", response_model=ConversationSummaryResponse)
+@router.get("/conversations/{conversation_id}/summary", response_model=ConversationSummaryEnvelope)
 def summarize_conversation(
     conversation_id: str,
-) -> ConversationSummaryResponse:
+) -> ConversationSummaryEnvelope | JSONResponse:
     try:
+        logger.info("Conversation summary started: conversation_id=%s", conversation_id)
         conversation_session = load_or_create_session(conversation_id)
+        logger.info(
+            "Conversation summary session loaded: conversation_id=%s turn_count=%s title_present=%s",
+            conversation_session.conversation_id,
+            len(conversation_session.turns),
+            bool(conversation_session.title),
+        )
         if not conversation_session.turns:
-            raise HTTPException(status_code=404, detail="Conversation has no turns.")
+            return _dataset_retrieve_error_response(404, "Conversation has no turns.")
 
         summary_markdown = summarize_conversation_history(
             conversation_title=conversation_session.title,
@@ -356,12 +477,33 @@ def summarize_conversation(
                 for turn in conversation_session.turns
             ],
         )
+        logger.info(
+            "Conversation summary generated: conversation_id=%s summary_length=%s",
+            conversation_session.conversation_id,
+            len(summary_markdown),
+        )
 
         response = ConversationSummaryResponse(
             conversation_id=conversation_session.conversation_id,
             conversation_title=conversation_session.title,
             summary_markdown=summary_markdown,
         )
-        return response.model_dump(by_alias=True)
+        logger.info(
+            "Conversation summary finished successfully: conversation_id=%s",
+            conversation_session.conversation_id,
+        )
+        return ConversationSummaryEnvelope(
+            code="0",
+            status=200,
+            msg="",
+            data=response.model_dump(by_alias=True),
+            success=True,
+        )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _dataset_retrieve_error_response(400, str(exc))
+    except Exception:
+        logger.exception(
+            "Unexpected error during conversation summary: conversation_id=%s",
+            conversation_id,
+        )
+        return _dataset_retrieve_error_response(500, "Internal server error.")
