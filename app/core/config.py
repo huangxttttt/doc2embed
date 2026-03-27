@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     dify_base_url: str = "http://172.23.27.133:8680"
     dify_dataset_api_key: str = ""
     dify_timeout_seconds: float = 30.0
+    dify_verify_ssl: bool = True
     llm_base_url: str = "https://api.deepseek.com/v1"
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"

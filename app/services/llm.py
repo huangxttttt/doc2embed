@@ -8,6 +8,17 @@ from fastapi import HTTPException
 from app.core.config import settings
 
 
+def _normalize_text(value: str) -> str:
+    return " ".join((value or "").strip().split())
+
+
+def _limit_retrieval_query_length(query: str, max_length: int = 250) -> str:
+    normalized = _normalize_text(query)
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[:max_length].rstrip()
+
+
 def _parse_message_content(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -161,9 +172,10 @@ def expand_query_for_retrieval(
     query: str,
     conversation_context: dict[str, Any] | None = None,
 ) -> str:
+    normalized_query = _limit_retrieval_query_length(query)
     normalized_context = _normalize_conversation_context(conversation_context)
     if normalized_context["turnCount"] <= 0 and not normalized_context["memorySummary"]:
-        return query
+        return normalized_query
 
     try:
         response = _post_chat_completion(
@@ -192,10 +204,12 @@ def expand_query_for_retrieval(
                 },
             ]
         )
-        expanded_query = str(response.get("expandedQuery", "")).strip()
-        return expanded_query or query
+        expanded_query = _limit_retrieval_query_length(
+            str(response.get("expandedQuery", ""))
+        )
+        return expanded_query or normalized_query
     except HTTPException:
-        return query
+        return normalized_query
 
 
 def analyze_documents(

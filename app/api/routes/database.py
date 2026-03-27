@@ -2,6 +2,7 @@ from http.client import IncompleteRead
 import json
 import logging
 from pathlib import Path
+import ssl
 from urllib import error, request
 from uuid import UUID
 
@@ -67,6 +68,20 @@ def _dataset_retrieve_error_response(status_code: int, msg: str) -> JSONResponse
             "success": False,
         },
     )
+
+
+
+
+
+def _prepare_dify_query(query: str, fallback_query: str, max_length: int = 250) -> str:
+    normalized = " ".join((query or "").split())
+    fallback = " ".join((fallback_query or "").split())
+    effective = normalized or fallback
+    if not effective:
+        raise ValueError("Query is required and cannot be empty.")
+    if len(effective) > max_length:
+        return effective[:max_length].rstrip()
+    return effective
 
 
 @router.get("/ping")
@@ -202,7 +217,7 @@ def retrieve_dataset(
         )
 
     dataset_url = (
-        f"{settings.dify_base_url.rstrip('/')}/v1/datasets/"
+        f"{settings.dify_base_url}/v1/datasets/"
         f"{payload.dataset_id}/retrieve"
     )
 
@@ -226,14 +241,16 @@ def retrieve_dataset(
             payload.query,
             conversation_context=conversation_context,
         )
+        dify_query = _prepare_dify_query(retrieval_query, payload.query)
         logger.info(
-            "Retrieval query prepared: conversation_id=%s retrieval_query=%s recent_turns=%s",
+            "Retrieval query prepared: conversation_id=%s retrieval_query=%s dify_query_length=%s recent_turns=%s",
             conversation_session.conversation_id,
-            retrieval_query,
+            dify_query,
+            len(dify_query),
             len(conversation_context.get("recentTurns", [])),
         )
 
-        body = json.dumps({"query": retrieval_query}).encode("utf-8")
+        body = json.dumps({"query": dify_query}).encode("utf-8")
         req = request.Request(
             dataset_url,
             data=body,
@@ -244,11 +261,21 @@ def retrieve_dataset(
             method="POST",
         )
         logger.info(
-            "Calling Dify dataset retrieve: url=%s timeout_seconds=%s",
+            "Calling Dify dataset retrieve: url=%s timeout_seconds=%s verify_ssl=%s",
             dataset_url,
             settings.dify_timeout_seconds,
+            settings.dify_verify_ssl,
         )
-        with request.urlopen(req, timeout=settings.dify_timeout_seconds) as response:
+        ssl_context = (
+            ssl.create_default_context()
+            if settings.dify_verify_ssl
+            else ssl._create_unverified_context()
+        )
+        with request.urlopen(
+            req,
+            timeout=settings.dify_timeout_seconds,
+            context=ssl_context,
+        ) as response:
             response_body = response.read().decode("utf-8")
             data = json.loads(response_body)
         logger.info(
@@ -442,6 +469,11 @@ def retrieve_dataset(
         return _dataset_retrieve_error_response(
             503,
             f"Unable to connect to Dify dataset service: {exc.reason}",
+        )
+    except ssl.SSLError as exc:
+        return _dataset_retrieve_error_response(
+            503,
+            f"SSL error while connecting to Dify dataset service: {exc}",
         )
     except json.JSONDecodeError as exc:
         return _dataset_retrieve_error_response(
