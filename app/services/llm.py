@@ -1,11 +1,14 @@
 from http.client import IncompleteRead
 import json
+import logging
 from typing import Any
 from urllib import error, request
 
 from fastapi import HTTPException
 
 from app.core.config import settings
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def _normalize_text(value: str) -> str:
@@ -17,6 +20,13 @@ def _limit_retrieval_query_length(query: str, max_length: int = 250) -> str:
     if len(normalized) <= max_length:
         return normalized
     return normalized[:max_length].rstrip()
+
+
+def _preview_text(value: str | None, max_length: int = 100) -> str:
+    normalized = _normalize_text(value or "")
+    if len(normalized) <= max_length:
+        return normalized
+    return f"{normalized[:max_length].rstrip()}..."
 
 
 def _parse_message_content(content: Any) -> str:
@@ -258,8 +268,23 @@ def analyze_documents(
         }
         for document in documents
     ]
+    logger.info(
+        "Starting document analysis: query=%s document_count=%s batch_size=%s",
+        query,
+        len(truncated_documents),
+        max(settings.llm_batch_size, 1),
+    )
 
-    for batch in _chunk_documents(truncated_documents, max(settings.llm_batch_size, 1)):
+    for batch_index, batch in enumerate(
+        _chunk_documents(truncated_documents, max(settings.llm_batch_size, 1)),
+        start=1,
+    ):
+        logger.info(
+            "Sending analysis batch to LLM: batch_index=%s batch_document_ids=%s batch_content_lengths=%s",
+            batch_index,
+            [str(document["documentId"]) for document in batch],
+            [len(str(document["content"])) for document in batch],
+        )
         response = _post_chat_completion(
             [
                 {
@@ -296,11 +321,37 @@ def analyze_documents(
                 },
             ]
         )
-        for item in response.get("documents", []):
+        response_documents = response.get("documents", [])
+        logger.info(
+            "Received analysis batch from LLM: batch_index=%s response_document_count=%s response_document_ids=%s",
+            batch_index,
+            len(response_documents),
+            [str(item.get("documentId")) for item in response_documents],
+        )
+        for item in response_documents:
             document_id = item.get("documentId")
             analysis = item.get("analysis")
+            logger.info(
+                "Processed analysis item: batch_index=%s document_id=%s analysis_present=%s analysis_length=%s analysis_preview=%s",
+                batch_index,
+                document_id,
+                bool(analysis),
+                len(str(analysis).strip()) if analysis is not None else 0,
+                _preview_text(str(analysis) if analysis is not None else ""),
+            )
             if document_id and analysis:
                 analysis_by_id[str(document_id)] = str(analysis)
+
+    missing_document_ids = [
+        str(document["documentId"])
+        for document in truncated_documents
+        if str(document["documentId"]) not in analysis_by_id
+    ]
+    logger.info(
+        "Document analysis aggregation completed: analyzed_document_count=%s missing_document_ids=%s",
+        len(analysis_by_id),
+        missing_document_ids,
+    )
 
     summary_response = _post_chat_completion(
         [
@@ -340,6 +391,11 @@ def analyze_documents(
         ]
     )
     summary = str(summary_response.get("summary", "")).strip()
+    logger.info(
+        "Generated final summary: summary_length=%s summary_preview=%s",
+        len(summary),
+        _preview_text(summary, max_length=300),
+    )
     return analysis_by_id, summary
 
 
